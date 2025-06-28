@@ -1,341 +1,404 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CoC Event Multi-Account – pro Account eigener Web-Socket-Server,
-ohne Lambda-Indizes (kein „Unresolved reference 'idx'“ mehr)
+CoC Event Multi-Account – scrollbare Accounts, Punktestatistik,
+Sound bei Disconnect, schnelleres Log, Import/Export der Accounts.
+Jetzt neu: Verbindungs-URL wird ins Log geschrieben.
 """
 
-import tkinter as tk
-from tkinter import ttk, scrolledtext, messagebox
-import websocket
-import threading
 import json
-import random
 import queue
+import random
+import threading
 import time
+import tkinter as tk
+from pathlib import Path
+from tkinter import filedialog, messagebox, scrolledtext, ttk
+from typing import List, Tuple
+
 import browser_cookie3
+import websocket
+
+try:  # Windows-Beep
+    import winsound
+
+    def beep():
+        winsound.MessageBeep(winsound.MB_ICONHAND)
+except ImportError:  # Fallback
+    def beep():
+        print("\a", end="", flush=True)
 
 
-MAX_LOG_LINES = 500
+MAX_LOG_LINES = 300
+ACCOUNT_FILE = "accounts.txt"
 
 
-# ────────────────────────────────────────────────
-#   Hintergrund-Thread für einen Account
-# ────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+#   Hintergrund-Thread pro Account
+# ════════════════════════════════════════════════════════════
 class AccountConnection(threading.Thread):
-    def __init__(self, server_url_base: str, token: str,
-                 log_queue: queue.Queue, gui_callback):
+    def __init__(self, host: str, token: str, log_q: queue.Queue, gui_cb):
         super().__init__(daemon=True)
-        self.server_url_base = server_url_base.rstrip('/')
-        self.token           = token
-        self.log_queue       = log_queue
-        self.gui_callback    = gui_callback
-        self.ws              = None
+        self.host = host  # nur host:port
+        self.token = token
+        self.log_q = log_q
+        self.gui_cb = gui_cb
 
-        self.answered_quizzes           = set()
-        self.answered_polls             = set()
-        self.answered_match_predictions = set()
+        self.ws = None
+        self.total_points = 0
+        self.answered_ids = set()
 
-    # -------------------------------------------
+    # --------------------------------------------------------
     def run(self):
-        url = (f"{self.server_url_base}?token={self.token}"
-               if not self.server_url_base.endswith("?token=")
-               else f"{self.server_url_base}{self.token}")
+        url = f"wss://{self.host}/?token={self.token}"
 
-        def send_vote(ws, payload):
-            ws.send(json.dumps(payload))
-            self.log_queue.put(("Gesendet", payload))
-            self.gui_callback()
+        # >>>>>>>>>>>>>>>  NEU: URL ins Log schreiben  <<<<<<<<<<<<<<
+        self.log_q.put(("Info", f"Verbinde zu {url}"))
+        self.gui_cb()
+        # <<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<
+
+        def send_vote(payload: dict):
+            self.ws.send(json.dumps(payload))
+            self.log_q.put(("Gesendet", payload))
+            self.gui_cb()
 
         # ---- Callbacks -----------------------------------
         def on_message(ws, message):
             try:
                 data = json.loads(message)
-
-                def relevant(item):
-                    return item.get("messageType") in {
-                        "poll", "quiz", "match_prediction"
-                    }
-
-                if isinstance(data, list):
-                    for item in filter(relevant, data):
-                        self.log_queue.put(("Empfangen", item))
-                        self.handle_event(ws, item, send_vote)
-                elif relevant(data):
-                    self.log_queue.put(("Empfangen", data))
-                    self.handle_event(ws, data, send_vote)
+                items = data if isinstance(data, list) else [data]
+                for item in items:
+                    mtype = item.get("messageType")
+                    if mtype in {"quiz", "poll", "match_prediction"}:
+                        self.log_q.put(("Empfangen", item))
+                        self.handle_event(item, send_vote)
             except Exception as e:
-                self.log_queue.put(("Error", f"Parsing: {e}"))
+                self.log_q.put(("Error", f"Parsing: {e}"))
             finally:
-                self.gui_callback()
+                self.gui_cb()
 
-        def on_error(ws, error):
-            self.log_queue.put(("Error", str(error)))
-            self.gui_callback()
+        def on_error(ws, err):
+            self.log_q.put(("Error", str(err)))
+            self.gui_cb()
 
         def on_close(ws, code, msg):
-            self.log_queue.put(("Info", f"Verbindung geschlossen: {code} {msg}"))
-            self.gui_callback()
+            self.log_q.put(("Closed", f"{code} {msg}"))
+            self.gui_cb()
 
         def on_open(ws):
-            self.log_queue.put(("Info", "Socket verbunden!"))
-            self.gui_callback()
+            self.log_q.put(("Info", "Verbunden"))
+            self.gui_cb()
 
         self.ws = websocket.WebSocketApp(
             url,
-            on_open    = on_open,
-            on_message = on_message,
-            on_error   = on_error,
-            on_close   = on_close,
+            on_open=on_open,
+            on_message=on_message,
+            on_error=on_error,
+            on_close=on_close,
             header=[
                 "Origin: https://event.supercell.com",
-                "User-Agent: Mozilla/5.0"
-            ]
+                "User-Agent: Mozilla/5.0",
+            ],
         )
         self.ws.run_forever()
 
-    # -------------------------------------------
-    def handle_event(self, ws, item, send_vote):
-        mtype   = item.get("messageType")
-        payload = item.get("payload", {})
+    # --------------------------------------------------------
+    def handle_event(self, item: dict, send_vote):
+        mtype = item["messageType"]
+        pl = item.get("payload", {})
+        type_id = pl.get("typeId")
 
-        if mtype == "poll":
-            type_id = payload.get("typeId")
-            if type_id in self.answered_polls:
-                return
-            alt_count = (
-                payload.get("alternatives")
-                if isinstance(payload.get("alternatives"), int)
-                else len(payload.get("alternatives") or payload.get("options") or []) or
-                     payload.get("optionsCount") or 4
+        if type_id in self.answered_ids:
+            return
+
+        ip = int(pl.get("interactionPoints", 0))
+        bonus = 0
+
+        if mtype == "quiz":
+            alt = pl.get("correctAnswer", {}).get("alternative")
+            pts = pl.get("correctAnswer", {}).get("points", 0)
+            if alt is not None:
+                send_vote(
+                    {
+                        "messageType": "quiz",
+                        "payload": {"typeId": type_id, "alternative": int(alt)},
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
+                bonus = pts
+
+        elif mtype == "poll":
+            alts = (
+                pl.get("alternatives")
+                if isinstance(pl.get("alternatives"), int)
+                else len(pl.get("alternatives") or pl.get("options") or [])
+                or pl.get("optionsCount")
+                or 4
             )
-            vote = {
-                "messageType": "poll",
-                "payload": {"typeId": type_id,
-                            "alternative": random.randint(1, alt_count)},
-                "timestamp": int(time.time() * 1000)
-            }
-            send_vote(ws, vote)
-            self.answered_polls.add(type_id)
+            send_vote(
+                {
+                    "messageType": "poll",
+                    "payload": {
+                        "typeId": type_id,
+                        "alternative": random.randint(1, alts),
+                    },
+                    "timestamp": int(time.time() * 1000),
+                }
+            )
 
         elif mtype == "match_prediction":
-            type_id = payload.get("typeId")
-            if type_id in self.answered_match_predictions:
-                return
-            answers   = payload.get("answers", {})
-            alt_index = max(answers, key=answers.get) if answers else None
-            if alt_index:
-                vote = {
-                    "messageType": "match_prediction",
-                    "payload": {"typeId": type_id,
-                                "alternative": int(alt_index)},
-                    "timestamp": int(time.time() * 1000)
-                }
-                send_vote(ws, vote)
-                self.answered_match_predictions.add(type_id)
+            alts = pl.get("answers", {})
+            if alts:
+                best = max(alts, key=alts.get)
+                bonus = pl.get("correctMatchPredictionPoints", 0)
+                send_vote(
+                    {
+                        "messageType": "match_prediction",
+                        "payload": {"typeId": type_id, "alternative": int(best)},
+                        "timestamp": int(time.time() * 1000),
+                    }
+                )
 
-        elif mtype == "quiz":
-            type_id = payload.get("typeId")
-            if type_id in self.answered_quizzes:
-                return
-            correct = payload.get("correctAnswer", {}).get("alternative")
-            if correct is not None:
-                vote = {
-                    "messageType": "quiz",
-                    "payload": {"typeId": type_id,
-                                "alternative": int(correct)},
-                    "timestamp": int(time.time() * 1000)
-                }
-                send_vote(ws, vote)
-                self.answered_quizzes.add(type_id)
-
-    def stop(self):
-        if self.ws:
-            self.ws.close()
+        self.total_points += ip + bonus
+        self.answered_ids.add(type_id)
 
 
-# ────────────────────────────────────────────────
-#   GUI-Frame für einen Account
-# ────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+#   GUI-Frame pro Account
+# ════════════════════════════════════════════════════════════
 class AccountFrame(ttk.Frame):
-    DEFAULT_SERVER = (
-        "wss://lb2.socketserver.clashersports.supercell.com:29049/?token="
-    )
+    def __init__(self, parent, remove_cb):
+        super().__init__(parent, relief="groove", padding=4)
+        self.remove_cb = remove_cb
 
-    def __init__(self, parent, remove_callback):
-        super().__init__(parent)
-        self.remove_callback = remove_callback
-        self.conn_thread     = None
-        self.log_queue       = queue.Queue()
-        self.log_history     = []
-        self.running         = False
-        self.last_log_len    = 0
+        self.conn: AccountConnection | None = None
+        self.running = False
+        self.log_q = queue.Queue()
+        self.log: List[Tuple[str, str | dict]] = []
+        self.last_len = 0
 
-        # ---------------- Eingaben ----------------
-        self.server_var = tk.StringVar(value=self.DEFAULT_SERVER)
-        self.token_var  = tk.StringVar()
+        self.host_var = tk.StringVar(value="lb2.socketserver.clashersports.supercell.com:29049")
+        self.token_var = tk.StringVar()
         self.filter_var = tk.StringVar()
-        self.filter_var.trace_add("write", lambda *_: self.show_log())
+        self.filter_var.trace_add("write", lambda *_: self.render_log())
 
-        ttk.Label(self, text="Server:").grid(row=0, column=0, sticky="w")
-        ttk.Entry(self, textvariable=self.server_var, width=70).grid(
-            row=0, column=1, columnspan=5, sticky="we", pady=1
-        )
+        self.points_var = tk.IntVar(value=0)
 
-        ttk.Label(self, text="Token:").grid(row=1, column=0, sticky="w")
-        ttk.Entry(self, textvariable=self.token_var, width=70).grid(
-            row=1, column=1, padx=2, sticky="w"
-        )
-        ttk.Button(self, text="Token aus Browser",
-                   command=self.get_token_from_browser).grid(row=1, column=2, padx=2)
+        # Layout ------------------------------------------------
+        ttk.Label(self, text="Server-Host:Port").grid(row=0, column=0, sticky="w")
+        ttk.Entry(self, textvariable=self.host_var, width=55).grid(row=0, column=1, columnspan=4, sticky="we")
 
-        self.start_btn  = ttk.Button(self, text="Start", command=self.start_account)
-        self.stop_btn   = ttk.Button(self, text="Stop",
-                                     command=self.stop_account, state=tk.DISABLED)
-        self.remove_btn = ttk.Button(self, text="Entfernen",
-                                     command=lambda: self.remove_callback(self))
+        ttk.Label(self, text="Token").grid(row=1, column=0, sticky="w")
+        ttk.Entry(self, textvariable=self.token_var, width=55).grid(row=1, column=1, columnspan=3, sticky="we")
+        ttk.Button(self, text="Token aus Browser", command=self.get_token).grid(row=1, column=4, padx=2)
 
-        self.start_btn.grid( row=1, column=3, padx=2)
-        self.stop_btn.grid(  row=1, column=4, padx=2)
-        self.remove_btn.grid(row=1, column=5, padx=2)
+        self.start_b = ttk.Button(self, text="Start", command=self.start)
+        self.stop_b = ttk.Button(self, text="Stop", command=self.stop, state=tk.DISABLED)
+        self.rem_b = ttk.Button(self, text="Entfernen", command=lambda: self.remove_cb(self))
 
-        ttk.Label(self, text="Filter:").grid(row=2, column=0, sticky="e")
-        ttk.Entry(self, textvariable=self.filter_var, width=20).grid(
-            row=2, column=1, sticky="w"
-        )
+        self.start_b.grid(row=0, column=5, padx=2)
+        self.stop_b.grid(row=1, column=5, padx=2)
+        self.rem_b.grid(row=2, column=5, padx=2)
 
-        self.log_text = scrolledtext.ScrolledText(
-            self, width=120, height=12, wrap="none", state=tk.DISABLED
-        )
-        self.log_text.grid(row=3, column=0, columnspan=6, pady=4, sticky="we")
+        ttk.Label(self, text="Punkte:").grid(row=2, column=0, sticky="e")
+        ttk.Label(self, textvariable=self.points_var, width=10).grid(row=2, column=1, sticky="w")
+
+        ttk.Label(self, text="Filter").grid(row=2, column=2, sticky="e")
+        ttk.Entry(self, textvariable=self.filter_var, width=18).grid(row=2, column=3, sticky="w")
+
+        self.log_txt = scrolledtext.ScrolledText(self, height=10, wrap="none", state=tk.DISABLED)
+        self.log_txt.grid(row=3, column=0, columnspan=6, sticky="we", pady=4)
 
         self.columnconfigure(1, weight=1)
-        self.show_log()
 
-    # -------------------------------------------
-    def get_token_from_browser(self):
+    # --------------------------------------------------------
+    def get_token(self):
         token = None
-        try:
-            cj = browser_cookie3.chrome(domain_name="event.supercell.com")
-            token = next((c.value for c in cj if c.name == "token"), None)
-        except Exception:
-            pass
-        if not token:
+        for getter in (browser_cookie3.chrome, browser_cookie3.firefox):
             try:
-                cj = browser_cookie3.firefox(domain_name="event.supercell.com")
+                cj = getter(domain_name="event.supercell.com")
                 token = next((c.value for c in cj if c.name == "token"), None)
+                if token:
+                    break
             except Exception:
                 pass
-
         if token:
             self.token_var.set(token)
         else:
-            messagebox.showerror(
-                "Token nicht gefunden",
-                ("Kein Token in Chrome/Firefox gefunden.\n"
-                 "Auf https://event.supercell.com eingeloggt?")
-            )
+            messagebox.showerror("Token", "Kein Token in Browser-Cookies gefunden.")
 
-    # -------------------------------------------
-    def start_account(self):
-        server = self.server_var.get().strip()
-        token  = self.token_var.get().strip()
-        if not server or not token:
-            messagebox.showwarning("Fehlende Daten",
-                                   "Bitte Server-URL *und* Token eintragen.")
+    # --------------------------------------------------------
+    def gui_log(self):
+        while not self.log_q.empty():
+            self.log.append(self.log_q.get())
+            self.log = self.log[-MAX_LOG_LINES:]
+
+        if self.conn:
+            self.points_var.set(self.conn.total_points)
+
+        if any(t == "Closed" for t, _ in self.log[self.last_len :]):
+            self.stop_b.config(state=tk.DISABLED)
+            self.start_b.config(state=tk.NORMAL)
+            self.running = False
+            beep()
+
+        self.render_log(append=True)
+        if self.running:
+            self.after(400, self.gui_log)
+
+    def render_log(self, append=False):
+        filt = self.filter_var.get().lower()
+        if not append:
+            self.log_txt.config(state=tk.NORMAL)
+            self.log_txt.delete(1.0, tk.END)
+            self.last_len = 0
+
+        new = self.log[self.last_len :]
+        for typ, msg in new:
+            raw = json.dumps(msg, ensure_ascii=False) if not isinstance(msg, str) else msg
+            if filt and filt not in raw.lower():
+                continue
+            self.log_txt.config(state=tk.NORMAL)
+            self.log_txt.insert(tk.END, f"[{typ:<7}] {raw}\n")
+            self.log_txt.config(state=tk.DISABLED)
+        if new:
+            self.log_txt.see(tk.END)
+            self.last_len = len(self.log)
+
+    # --------------------------------------------------------
+    def start(self):
+        host, token = self.host_var.get().strip(), self.token_var.get().strip()
+        if not host or not token:
+            messagebox.showwarning("Angaben fehlen", "Bitte Host und Token eintragen.")
             return
 
-        self.conn_thread = AccountConnection(server, token,
-                                             self.log_queue, self.update_log)
-        self.conn_thread.start()
+        self.conn = AccountConnection(host, token, self.log_q, self.gui_log)
+        self.conn.start()
 
         self.running = True
-        self.start_btn.config(state=tk.DISABLED)
-        self.stop_btn.config(state=tk.NORMAL)
+        self.start_b.config(state=tk.DISABLED)
+        self.stop_b.config(state=tk.NORMAL)
+        self.after(400, self.gui_log)
 
-    def stop_account(self):
-        if self.conn_thread:
-            self.conn_thread.stop()
+    def stop(self):
+        if self.conn:
+            self.conn.ws and self.conn.ws.close()
         self.running = False
-        self.start_btn.config(state=tk.NORMAL)
-        self.stop_btn.config(state=tk.DISABLED)
+        self.start_b.config(state=tk.NORMAL)
+        self.stop_b.config(state=tk.DISABLED)
 
-    # -------------------------------------------
-    #   Log
-    # -------------------------------------------
-    def update_log(self):
-        while not self.log_queue.empty():
-            self.log_history.append(self.log_queue.get())
-            if len(self.log_history) > MAX_LOG_LINES:
-                self.log_history = self.log_history[-MAX_LOG_LINES:]
-        self.show_log(append_only=True)
-        if self.running:
-            self.after(500, self.update_log)
+    # --------------------------------------------------------
+    def export_line(self):
+        return f"{self.host_var.get().strip()}|{self.token_var.get().strip()}"
 
-    def show_log(self, append_only=False):
-        filter_text = self.filter_var.get().lower()
-        if not append_only:
-            self.log_text.config(state=tk.NORMAL)
-            self.log_text.delete(1.0, tk.END)
-            self.last_log_len = 0
+    def import_line(self, line: str):
+        if "|" in line:
+            host, token = line.split("|", 1)
+            self.host_var.set(host.strip())
+            self.token_var.set(token.strip())
 
-        new_entries = self.log_history[self.last_log_len:]
-        for typ, msg in new_entries:
-            raw = json.dumps(msg, ensure_ascii=False) \
-                  if not isinstance(msg, str) else msg
-            if filter_text and filter_text not in raw.lower():
-                continue
-            prefix = f"[{typ}]".ljust(11)
-            self.log_text.config(state=tk.NORMAL)
-            self.log_text.insert(tk.END, f"{prefix} {raw}\n")
-            self.log_text.config(state=tk.DISABLED)
-
-        if new_entries:
-            self.log_text.see(tk.END)
-            self.last_log_len = len(self.log_history)
-
-    # -------------------------------------------
+    # --------------------------------------------------------
     def destroy(self):
-        self.stop_account()
+        self.stop()
         super().destroy()
 
 
-# ────────────────────────────────────────────────
-#   Haupt-GUI
-# ────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
+#   Haupt-Fenster
+# ════════════════════════════════════════════════════════════
 class MainApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("CoC Event Multi-Account")
-        self.geometry("1250x800")
+        self.minsize(900, 600)
 
-        self.account_frames = []
+        menubar = tk.Menu(self)
+        file_m = tk.Menu(menubar, tearoff=False)
+        file_m.add_command(label="Accounts laden …", command=self.load_accounts)
+        file_m.add_command(label="Accounts speichern …", command=self.save_accounts)
+        file_m.add_separator()
+        file_m.add_command(label="Beenden", command=self.destroy)
+        menubar.add_cascade(label="Datei", menu=file_m)
+        self.config(menu=menubar)
 
-        ctl = ttk.Frame(self)
-        ctl.pack(fill=tk.X, padx=10, pady=5)
-        ttk.Button(ctl, text="+ Account", command=self.add_account).pack(side=tk.LEFT)
+        wrapper = ttk.Frame(self)
+        wrapper.pack(fill="both", expand=True)
 
-        self.container = ttk.Frame(self)
-        self.container.pack(fill=tk.BOTH, expand=True)
+        self.canvas = tk.Canvas(wrapper, highlightthickness=0)
+        vsb = ttk.Scrollbar(wrapper, orient="vertical", command=self.canvas.yview)
+        self.canvas.configure(yscrollcommand=vsb.set)
 
+        vsb.pack(side="right", fill="y")
+        self.canvas.pack(side="left", fill="both", expand=True)
+
+        self.inner = ttk.Frame(self.canvas)
+        self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.inner.bind(
+            "<Configure>", lambda e: self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+        )
+        self.canvas.bind_all("<MouseWheel>", self._wheel)
+
+        ttk.Button(self, text="+ Account", command=self.add_account).pack(pady=4)
+
+        self.frames: List[AccountFrame] = []
         self.add_account()
 
+    # --------------------------------------------------------
+    def _wheel(self, event):
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
     def add_account(self):
-        frame = AccountFrame(self.container, self.remove_account)
-        frame.pack(fill=tk.X, padx=8, pady=8)
-        self.account_frames.append(frame)
+        f = AccountFrame(self.inner, self.remove_account)
+        f.pack(fill="x", pady=6, padx=6)
+        self.frames.append(f)
 
     def remove_account(self, frame: AccountFrame):
         frame.destroy()
-        self.account_frames.remove(frame)
+        self.frames.remove(frame)
+
+    # --------------------------------------------------------
+    def load_accounts(self):
+        path = filedialog.askopenfilename(
+            title="Accounts laden …",
+            initialfile=ACCOUNT_FILE,
+            filetypes=[("Textdateien", "*.txt"), ("Alle Dateien", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            lines = Path(path).read_text(encoding="utf-8").splitlines()
+            for f in list(self.frames):
+                self.remove_account(f)
+            for ln in lines:
+                if "|" in ln:
+                    self.add_account()
+                    self.frames[-1].import_line(ln)
+        except Exception as e:
+            messagebox.showerror("Import", str(e))
+
+    def save_accounts(self):
+        path = filedialog.asksaveasfilename(
+            defaultextension=".txt",
+            initialfile=ACCOUNT_FILE,
+            title="Accounts speichern …",
+            filetypes=[("Textdateien", "*.txt"), ("Alle Dateien", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            Path(path).write_text("\n".join(f.export_line() for f in self.frames), encoding="utf-8")
+        except Exception as e:
+            messagebox.showerror("Export", str(e))
 
 
-# ────────────────────────────────────────────────
+# ════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     try:
         import websocket  # noqa: F401
     except ImportError:
-        print("Installiere 'websocket-client' mit:\n    pip install websocket-client")
-        exit(1)
+        messagebox.showerror(
+            "Abhängigkeit fehlt", "Bitte zuerst installieren:\n\npip install websocket-client"
+        )
+        raise SystemExit
 
     MainApp().mainloop()
