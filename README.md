@@ -12,3 +12,4 @@ https://github.com/neraxor/coc/blob/main/network.jpg
 10. token aus schritt 6 eingeben
 11. start drücken
 
+https://github.com/neraxor/coc/blob/main/programm.jpg
