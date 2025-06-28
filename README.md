@@ -11,7 +11,7 @@ programm:
 7. im header den host kopieren zb: lb2.socketserver.clashesports.supercell.com:29049 ggf. siehe screenshot
 ![Screenshot](https://github.com/neraxor/coc/blob/main/network.jpg)
 8. im payload das token kopieren (oder im request url alles nach token= ) ggf. siehe screenshot
-9. im programm bei server den entsprechenden host eintragen wie zb wss://lb2.socketserver.clashesports.supercell.com:29049/?token= (Achtung anfang und ende muss gleich bleiben nur die URL ggf. anpassen)
+9. im programm bei server den entsprechenden host eintragen wie zb lb2.socketserver.clashesports.supercell.com:29049 
 10. token aus schritt 6 eingeben
 11. start drücken
 
